@@ -1,0 +1,41 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "dynfu.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": ["--config", "configs/seq026.yaml", "--save_dir", "reconstruct/seq026"]
+        },{
+            "name": "Preprocess (debug)",
+            "type": "python",
+            "request": "launch",
+            "program": "dataset/preprocess.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": ["--config", "configs/fr3_walking_xyz.yaml", ]
+        },{
+            "name": "dynfu (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "dynfu",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config","configs/fr3_sitting_halfsphere.yaml",
+                // "--config","configs/fr1_xyz.yaml",
+                "--save_dir","reconstruct/fr3_sitting_halfsphere"
+                // "--save_dir","reconstruct/fr1_xyz"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "7",
+            }
+        },
+    ]
+}

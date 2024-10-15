@@ -1,0 +1,13 @@
+.idea/
+__pycache__/
+*.ply
+*.npz
+*.png
+render/
+reconstruct/
+env/
+*.jpg
+dataset/
+_torchshow
+tests/
+
