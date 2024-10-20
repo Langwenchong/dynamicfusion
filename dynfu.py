@@ -107,7 +107,8 @@ def reg_term(
         -1, knn, 3
     )
     dgv_warped_rep = dgv_warped.view(-1, 1, 3).repeat_interleave(knn, 1)
-    el2 = torch.linalg.norm(dgv_nn_warp - dgv_warped_rep, dim=2) ** 2
+    el2 = torch.linalg.norm(dgv_nn_warp - dgv_warped_rep, dim=2)**2
+    # print(el2)
     ssel2 = el2.mean()
     return ssel2
 
@@ -143,8 +144,8 @@ def energy(
     # data_val = data_val_tmp2.sum() / torch.tensor(data_val_tmp >1e-5).sum()
     data_val = data_val_tmp.mean()
     reg_val = reg_term(Tlw, dgv, dgse_dq, dgw, dgv_nn)
-    re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
-    # re = data_val
+    # re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
+    re = data_val
     return re, re
 
 
@@ -198,6 +199,9 @@ def optim_energy(
     activated_map = torch.zeros(H,W,3)
     res = []
     node_to_nn = []
+    dists_nn=[]
+    vertex_nn=[]
+    w2c = torch.inverse(Tlw).to(vertex_map.device)
     mask0_idx  = (mask0 ).nonzero(as_tuple=False)
     mask_hat_idx = (mask_hat  ).nonzero(as_tuple=False)
     activated_map[mask0_idx[:,0],mask0_idx[:,1] ] = torch.tensor(RED).float()
@@ -216,17 +220,28 @@ def optim_energy(
         if y0 == y and x == x0:
             continue
         activated_map[y,x] = torch.tensor(GREEN).float()
-        dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        # Convert the vertex_map point from camera coordinates to world coordinates
+        vertex_cam = vertex_map[y, x]
+        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
         # If there are missing neighbors, skip the point
         if dgv.shape[0] in idx:
             continue
+        # vertex_nn存储vertex_map[y,x]以及其knn个邻居的坐标
+        tmp=[]
+        tmp.append(vertex_world)
+        for idxx in idx:
+            tmp.append(dgv[idxx])
+        vertex_nn.append(tmp)
+        dists_nn.append(dists)
         node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
         res.append(
             torch.stack(
                 [
                     vertex0[y0, x0],
                     normal0[y0, x0],
-                    vertex_map[y, x],
+                    vertex_world.to(vertex_map.device),
+                    # vertex_map[y, x],
                     normal_map[y, x],
                 ]
             )
@@ -245,17 +260,27 @@ def optim_energy(
         if y0 == y and x == x0:
             continue
         activated_map[y0,x0] = torch.tensor(GREEN).float()
-        dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        # dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        vertex_cam = vertex_map[y, x]
+        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
         # If there are missing neighbors, skip the point
         if dgv.shape[0] in idx:
             continue
+        tmp=[]
+        tmp.append(vertex_world)
+        for idxx in idx:
+            tmp.append(dgv[idxx])
+        vertex_nn.append(tmp)
+        dists_nn.append(dists)
         node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
         res.append(
             torch.stack(
                 [
                     vertex0[y0, x0],
                     normal0[y0, x0],
-                    vertex_map[y, x],
+                    vertex_world.to(vertex_map.device),
+                    # vertex_map[y, x],
                     normal_map[y, x],
                 ]
             )
@@ -279,7 +304,7 @@ def optim_energy(
     patient = 0
     aggressive = 0
     backup_dgse = None
-    for i in range(10):
+    for i in range(5):
         t1 = time.time()
         print("start compute jse3")
         jse3, fx = energy_jac(res, Tlw, dgv, dgse, dgw, node_to_nn, dgv_nn)
@@ -405,6 +430,19 @@ class DynFu:
             else:  # tracking
                 print("Start optimize! ")
                 verts, faces, norms = self.tsdf_volume.get_mesh(istorch=True)
+                # 获取verts在xyz维度的最大最小值与平均值
+                # x_min, x_max = verts[:, 0].min(), verts[:, 0].max()
+                # x_mean = verts[:, 0].mean()
+                # y_min, y_max = verts[:, 1].min(), verts[:, 1].max()
+                # y_mean = verts[:, 1].mean()
+                # z_min, z_max = verts[:, 2].min(), verts[:, 2].max()
+                # z_mean = verts[:, 2].mean()
+                # print(f"verts x_min: {x_min}, x_max: {x_max}")
+                # print(f"verts x_mean: {x_mean}")
+                # print(f"verts y_min: {y_min}, y_max: {y_max}")
+                # print(f"verts y_mean: {y_mean}")
+                # print(f"verts z_min: {z_min}, z_max: {z_max}")
+                # print(f"verts z_mean: {z_mean}")
                 partial_tsdf = trimesh.Trimesh(
                     vertices=verts, faces=faces, vertex_normals=norms
                 )
@@ -419,6 +457,22 @@ class DynFu:
                     verts_warp = warp_to_live_frame(
                         verts, Tlw_i, self.dgv, dgse_dq, self.dgw, self._kdtree
                     )
+                    # 获取verts_warp在xyz维度的最大最小值
+                    # x_min, x_max = verts_warp[:, 0].min(), verts_warp[:, 0].max()
+                    # # 计算平均值
+                    # x_mean = verts_warp[:, 0].mean()
+                    # y_min, y_max = verts_warp[:, 1].min(), verts_warp[:, 1].max()
+                    # y_mean = verts_warp[:, 1].mean()
+                    # z_min, z_max = verts_warp[:, 2].min(), verts_warp[:, 2].max()
+                    # z_mean = verts_warp[:, 2].mean()
+                    # print(f"verts_warp x_min: {x_min}, x_max: {x_max}")
+                    # print(f"verts_warp x_mean: {x_mean}")
+                    # print(f"verts_warp y_min: {y_min}, y_max: {y_max}")
+                    # print(f"verts_warp y_mean: {y_mean}")
+                    # print(f"verts_warp z_min: {z_min}, z_max: {z_max}")
+                    # print(f"verts_warp z_mean: {z_mean}")
+
+                
                     partial_tsdf = trimesh.Trimesh(
                         vertices=verts_warp, faces=faces, vertex_normals=norms
                     )
@@ -438,6 +492,19 @@ class DynFu:
                         image_size,
                         self.device,
                     )
+                    # 获取vertex_map在xyz维度的最大最小值
+                    # x_min, x_max = vertex_map[:, :, 0].min(), vertex_map[:, :, 0].max()
+                    # x_mean = vertex_map[:, :, 0].mean()
+                    # y_min, y_max = vertex_map[:, :, 1].min(), vertex_map[:, :, 1].max()
+                    # y_mean = vertex_map[:, :, 1].mean()
+                    # z_min, z_max = vertex_map[:, :, 2].min(), vertex_map[:, :, 2].max()
+                    # z_mean = vertex_map[:, :, 2].mean()
+                    # print(f"vertex_map x_min: {x_min}, x_max: {x_max}")
+                    # print(f"vertex_map x_mean: {x_mean}")
+                    # print(f"vertex_map y_min: {y_min}, y_max: {y_max}")
+                    # print(f"vertex_map y_mean: {y_mean}")
+                    # print(f"vertex_map z_min: {z_min}, z_max: {z_max}")
+                    # print(f"vertex_map z_mean: {z_mean}")
 
                     plot_vis_depthmap(depth_map, f"{args.save_dir}/vis", i)
                     if j %1 ==0:
@@ -448,6 +515,15 @@ class DynFu:
                         verts_warp = warp_to_live_frame(
                             verts, Tlw_i, self.dgv, dgse_dq, self.dgw, self._kdtree
                         )
+                        # 用Tlw_i将verts_warp还原回原始坐标系
+                        # verts_origin = Tlw.type_as(verts_warp)[:3, :3] @ verts_warp.T + Tlw.type_as(verts_warp)[:3, 3].view(3, 1)
+                        # verts_origin = verts_origin.T
+                        # partial_tsdf = trimesh.Trimesh(
+                        #     vertices=verts_origin, faces=faces, vertex_normals=norms
+                        # )
+                        # partial_tsdf.export(
+                        #     os.path.join(args.save_dir, f"origin_mesh_{str(i).zfill(6)}.obj")
+                        # )
                         # render depth, vertex and normal
                         image_size = [H, W]
                         # we already use Tlw_i in warping, so no need of passing it into rendering function
@@ -471,7 +547,7 @@ class DynFu:
                         depth_map,
                         normal_map,
                         vertex_map,
-                        Tlw_i,
+                        Tlw_i, #w2c
                         self.dgv,
                         self.dgse,
                         self.dgw,
@@ -514,7 +590,7 @@ class DynFu:
             else:
                 print("Start update graph!")
                 try:
-                    # self.update_graph(Tlw)
+                    self.update_graph(Tlw)
                     print(f"Done, now we have {self.dgv.shape[0]} nodes!")
                 except Exception as e:
                     print(f"Failed to update graph because of {e}! ")
@@ -562,10 +638,24 @@ class DynFu:
         """_summary_
         """        
         verts, faces, norms = self.tsdf_volume.get_mesh()
-        self._radius = 0.01  # the paper said e = 0.01 in experiment
+        self._radius = 0.1  # the paper said e = 0.01 in experiment
         self._vertices = verts
         self._faces = faces
         nodes_v, nodes_idx = uniform_sample(self._vertices, self._radius)
+        # 获取nodes_v在x,y,z维度的最大最小值
+        # x_min, x_max = nodes_v[:, 0].min(), nodes_v[:, 0].max()
+        # # 平均值
+        # x_mean = nodes_v[:, 0].mean()
+        # y_min, y_max = nodes_v[:, 1].min(), nodes_v[:, 1].max()
+        # y_mean = nodes_v[:, 1].mean()
+        # z_min, z_max = nodes_v[:, 2].min(), nodes_v[:, 2].max()
+        # z_mean = nodes_v[:, 2].mean()
+        # print(f"nodes_v x_min: {x_min}, x_max: {x_max}")
+        # print(f"nodes_v x_mean: {x_mean}")
+        # print(f"nodes_v y_min: {y_min}, y_max: {y_max}")
+        # print(f"nodes_v y_mean: {y_mean}")
+        # print(f"nodes_v z_min: {z_min}, z_max: {z_max}")
+        # print(f"nodes_v z_mean: {z_mean}")
         mesh = trimesh.Trimesh(vertices=verts,faces=faces)
         mesh.export(os.path.join(args.save_dir, f"init_mesh.obj"))
         point_cloud = trimesh.PointCloud(nodes_v)

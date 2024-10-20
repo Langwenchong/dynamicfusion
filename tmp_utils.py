@@ -369,8 +369,8 @@ def warp_helper(
         torch.tensor: _description_
     """
     dgv_nn = dgv[node_to_nn]
-    print("Xc:",Xc)
-    print("dgv_nn:",dgv_nn)
+    # print("Xc:",Xc)
+    # print("dgv_nn:",dgv_nn)
     dgw_nn = dgw[node_to_nn]
     dgse_nn = dgse[node_to_nn]
     T = get_W(Xc, Tlw, dgse_nn, dgw_nn, dgv_nn)
