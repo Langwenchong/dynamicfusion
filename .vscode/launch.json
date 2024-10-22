@@ -4,7 +4,6 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
         {
             "name": "Python: Current File",
             "type": "python",
@@ -20,7 +19,7 @@
             "program": "dataset/preprocess.py",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--config", "configs/fr3_walking_xyz.yaml", ]
+            "args": ["--config", "configs/fr3_sitting_halfsphere.yaml", ]
         },{
             "name": "dynfu (Debug)",
             "type": "debugpy",

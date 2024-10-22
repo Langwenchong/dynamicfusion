@@ -147,8 +147,8 @@ def energy(
     # data_val = data_val_tmp2.sum() / torch.tensor(data_val_tmp >1e-5).sum()
     data_val = data_val_tmp.mean()
     reg_val = reg_term(Tlw, dgv, dgse_dq, dgw, dgv_nn)
-    re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
-    # re = data_val
+    # re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
+    re = data_val
     return re, re
 
 
@@ -307,7 +307,7 @@ def optim_energy(
     patient = 0
     aggressive = 0
     backup_dgse = None
-    for i in range(10):
+    for i in range(5):
         t1 = time.time()
         print("start compute jse3")
         jse3, fx = energy_jac(res, Tlw, dgv, dgse, dgw, node_to_nn, dgv_nn)

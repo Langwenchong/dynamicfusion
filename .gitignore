@@ -10,4 +10,5 @@ env/
 dataset/
 _torchshow
 tests/
+*.vsix
 
