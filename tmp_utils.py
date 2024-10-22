@@ -229,9 +229,9 @@ def blending(
     # print("dgv:",dgv)
     ze = torch.tensor(0.0).type_as(wixc_)
     wixc = torch.where(torch.isclose(wixc_, ze, atol=0.5),ze,wixc_ )
-    # print("wixc:",wixc,wixc.shape)
-    # print("dgv-repxc:",-torch.linalg.norm(dgv-repxc),(-torch.linalg.norm(dgv-repxc)).shape)
-    # print("dgw2:",2*torch.pow(dgw,2),dgw.shape)
+    print("wixc:",wixc,wixc.shape)
+    print("dgv-repxc:",-torch.linalg.norm(dgv-repxc),(-torch.linalg.norm(dgv-repxc)).shape)
+    print("dgw2:",2*torch.pow(dgw,2),dgw.shape)
     assert wixc.shape == dgw.shape
     qkc = torch.einsum("i,ik->k", wixc, dqs)
     # print("qkc:",qkc)
@@ -369,8 +369,8 @@ def warp_helper(
         torch.tensor: _description_
     """
     dgv_nn = dgv[node_to_nn]
-    print("Xc:",Xc)
-    print("dgv_nn:",dgv_nn)
+    # print("Xc:",Xc)
+    # print("dgv_nn:",dgv_nn)
     dgw_nn = dgw[node_to_nn]
     dgse_nn = dgse[node_to_nn]
     T = get_W(Xc, Tlw, dgse_nn, dgw_nn, dgv_nn)
@@ -594,3 +594,49 @@ def make_dq_from_vec(vec: torch.tensor) -> torch.tensor:
 
 def get_vmap_make_dq_from_vec() -> Any:
     return vmap(make_dq_from_vec, in_dims=(0))
+
+# 提取旋转向量 theta 和平移向量 t
+def extract_theta_from_q(q_real: torch.tensor) -> torch.tensor:
+    """
+    从旋转四元数 q_real 提取旋转向量 theta
+    """
+    
+    # 计算旋转角度的模
+    theta_norm = 2 * torch.acos(q_real[0])  # 旋转角度的模
+    
+    # 避免 theta_norm == 0 的情况，用 where 代替 if 语句
+    sin_half_theta = torch.sqrt(torch.clamp(1 - q_real[0]**2, min=1e-6))  # 防止除以零
+    axis = torch.stack([q_real[1], q_real[2], q_real[3]]) / sin_half_theta
+    
+    # 如果 theta_norm 为零，旋转向量应该为零向量
+    theta = theta_norm * axis
+    theta = torch.where(theta_norm == 0, torch.zeros(3).to(q_real), theta)
+    
+    return theta
+
+def extract_translation_from_dual(dq: torch.tensor) -> torch.tensor:
+    
+    # 根据对偶四元数和平移的关系推导平移向量 t
+    translation = 2 * torch.tensor([
+        -dq[4]*dq[1] + dq[5]*dq[0] - dq[6]*dq[3] + dq[7]*dq[2],
+        -dq[4]*dq[2] + dq[5]*dq[3] + dq[6]*dq[0] - dq[7]*dq[1],
+        -dq[4]*dq[3] - dq[5]*dq[2] + dq[6]*dq[1] + dq[7]*dq[0]
+    ])
+    
+    return translation
+
+# 从8维对偶四元数提取旋转向量 theta 和平移向量 t
+def inverse_dq_to_vec(dq: torch.tensor) -> torch.tensor:
+    """
+    从8维对偶四元数 dq 提取旋转向量 theta 和平移向量 t
+    返回一个6维向量，前3维是旋转，后3维是平移
+    """
+
+    # 提取旋转向量 theta
+    theta = extract_theta_from_q(dq[0:4])
+    
+    # 提取平移向量 t
+    translation = extract_translation_from_dual(dq)
+    
+    # 合并为一个6维向量
+    return torch.stack([theta, translation])

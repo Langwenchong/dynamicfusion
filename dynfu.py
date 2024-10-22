@@ -26,6 +26,7 @@ from tmp_utils import (
     plot_heatmap_step,
     plot_vis_activemap,
     get_vmap_make_dq_from_vec,
+    inverse_dq_to_vec
 )
 import time
 from functorch import vmap, jacrev
@@ -97,17 +98,20 @@ def reg_term(
     shape = dgv.shape
     knn = dgv_nn.shape[1]
     # self warp
+    print('reg term self warp')
     warp_helper_vmap = vmap(warp_helper, in_dims=(0, None, None, None, None, 0))
     dgv_warped = warp_helper_vmap(dgv, Tlw, dgv, dgse, dgw, dgv_nn)
 
     # self warp with neighbors' se3
+    print('reg term warp with neighbors')
     dgv_nn_nn = dgv_nn[dgv_nn].view(-1, knn)
     dgv_rep = dgv.view(-1, 1, 3).repeat_interleave(knn, 1).view(-1, 3)
     dgv_nn_warp = warp_helper_vmap(dgv_rep, Tlw, dgv, dgse, dgw, dgv_nn_nn).view(
         -1, knn, 3
     )
     dgv_warped_rep = dgv_warped.view(-1, 1, 3).repeat_interleave(knn, 1)
-    el2 = torch.linalg.norm(dgv_nn_warp - dgv_warped_rep, dim=2) ** 2
+    el2 = torch.linalg.norm(dgv_nn_warp - dgv_warped_rep, dim=2)**2
+    # print(el2)
     ssel2 = el2.mean()
     return ssel2
 
@@ -198,6 +202,9 @@ def optim_energy(
     activated_map = torch.zeros(H,W,3)
     res = []
     node_to_nn = []
+    dists_nn=[]
+    vertex_nn=[]
+    w2c = torch.inverse(Tlw).to(vertex_map.device)
     mask0_idx  = (mask0 ).nonzero(as_tuple=False)
     mask_hat_idx = (mask_hat  ).nonzero(as_tuple=False)
     activated_map[mask0_idx[:,0],mask0_idx[:,1] ] = torch.tensor(RED).float()
@@ -216,17 +223,28 @@ def optim_energy(
         if y0 == y and x == x0:
             continue
         activated_map[y,x] = torch.tensor(GREEN).float()
-        dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        # Convert the vertex_map point from camera coordinates to world coordinates
+        vertex_cam = vertex_map[y, x]
+        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
         # If there are missing neighbors, skip the point
         if dgv.shape[0] in idx:
             continue
+        # vertex_nn存储vertex_map[y,x]以及其knn个邻居的坐标
+        tmp=[]
+        tmp.append(vertex_world)
+        for idxx in idx:
+            tmp.append(dgv[idxx])
+        vertex_nn.append(tmp)
+        dists_nn.append(dists)
         node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
         res.append(
             torch.stack(
                 [
                     vertex0[y0, x0],
                     normal0[y0, x0],
-                    vertex_map[y, x],
+                    vertex_world.to(vertex_map.device),
+                    # vertex_map[y, x],
                     normal_map[y, x],
                 ]
             )
@@ -245,17 +263,27 @@ def optim_energy(
         if y0 == y and x == x0:
             continue
         activated_map[y0,x0] = torch.tensor(GREEN).float()
-        dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        # dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+        vertex_cam = vertex_map[y, x]
+        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
         # If there are missing neighbors, skip the point
         if dgv.shape[0] in idx:
             continue
+        tmp=[]
+        tmp.append(vertex_world)
+        for idxx in idx:
+            tmp.append(dgv[idxx])
+        vertex_nn.append(tmp)
+        dists_nn.append(dists)
         node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
         res.append(
             torch.stack(
                 [
                     vertex0[y0, x0],
                     normal0[y0, x0],
-                    vertex_map[y, x],
+                    vertex_world.to(vertex_map.device),
+                    # vertex_map[y, x],
                     normal_map[y, x],
                 ]
             )
@@ -393,7 +421,7 @@ class DynFu:
         make_dq_from_vec_vmap = get_vmap_make_dq_from_vec()
         for i_ in range(0, len(self.dataset), 1):
             # start from frame 20
-            i = i_- 150
+            i = i_- 49
             if i <0: continue
             t0 = get_time()
             sample = self.dataset[i_]
@@ -405,6 +433,19 @@ class DynFu:
             else:  # tracking
                 print("Start optimize! ")
                 verts, faces, norms = self.tsdf_volume.get_mesh(istorch=True)
+                # 获取verts在xyz维度的最大最小值与平均值
+                # x_min, x_max = verts[:, 0].min(), verts[:, 0].max()
+                # x_mean = verts[:, 0].mean()
+                # y_min, y_max = verts[:, 1].min(), verts[:, 1].max()
+                # y_mean = verts[:, 1].mean()
+                # z_min, z_max = verts[:, 2].min(), verts[:, 2].max()
+                # z_mean = verts[:, 2].mean()
+                # print(f"verts x_min: {x_min}, x_max: {x_max}")
+                # print(f"verts x_mean: {x_mean}")
+                # print(f"verts y_min: {y_min}, y_max: {y_max}")
+                # print(f"verts y_mean: {y_mean}")
+                # print(f"verts z_min: {z_min}, z_max: {z_max}")
+                # print(f"verts z_mean: {z_mean}")
                 partial_tsdf = trimesh.Trimesh(
                     vertices=verts, faces=faces, vertex_normals=norms
                 )
@@ -419,6 +460,22 @@ class DynFu:
                     verts_warp = warp_to_live_frame(
                         verts, Tlw_i, self.dgv, dgse_dq, self.dgw, self._kdtree
                     )
+                    # 获取verts_warp在xyz维度的最大最小值
+                    # x_min, x_max = verts_warp[:, 0].min(), verts_warp[:, 0].max()
+                    # # 计算平均值
+                    # x_mean = verts_warp[:, 0].mean()
+                    # y_min, y_max = verts_warp[:, 1].min(), verts_warp[:, 1].max()
+                    # y_mean = verts_warp[:, 1].mean()
+                    # z_min, z_max = verts_warp[:, 2].min(), verts_warp[:, 2].max()
+                    # z_mean = verts_warp[:, 2].mean()
+                    # print(f"verts_warp x_min: {x_min}, x_max: {x_max}")
+                    # print(f"verts_warp x_mean: {x_mean}")
+                    # print(f"verts_warp y_min: {y_min}, y_max: {y_max}")
+                    # print(f"verts_warp y_mean: {y_mean}")
+                    # print(f"verts_warp z_min: {z_min}, z_max: {z_max}")
+                    # print(f"verts_warp z_mean: {z_mean}")
+
+                
                     partial_tsdf = trimesh.Trimesh(
                         vertices=verts_warp, faces=faces, vertex_normals=norms
                     )
@@ -438,6 +495,19 @@ class DynFu:
                         image_size,
                         self.device,
                     )
+                    # 获取vertex_map在xyz维度的最大最小值
+                    # x_min, x_max = vertex_map[:, :, 0].min(), vertex_map[:, :, 0].max()
+                    # x_mean = vertex_map[:, :, 0].mean()
+                    # y_min, y_max = vertex_map[:, :, 1].min(), vertex_map[:, :, 1].max()
+                    # y_mean = vertex_map[:, :, 1].mean()
+                    # z_min, z_max = vertex_map[:, :, 2].min(), vertex_map[:, :, 2].max()
+                    # z_mean = vertex_map[:, :, 2].mean()
+                    # print(f"vertex_map x_min: {x_min}, x_max: {x_max}")
+                    # print(f"vertex_map x_mean: {x_mean}")
+                    # print(f"vertex_map y_min: {y_min}, y_max: {y_max}")
+                    # print(f"vertex_map y_mean: {y_mean}")
+                    # print(f"vertex_map z_min: {z_min}, z_max: {z_max}")
+                    # print(f"vertex_map z_mean: {z_mean}")
 
                     plot_vis_depthmap(depth_map, f"{args.save_dir}/vis", i)
                     if j %1 ==0:
@@ -448,6 +518,15 @@ class DynFu:
                         verts_warp = warp_to_live_frame(
                             verts, Tlw_i, self.dgv, dgse_dq, self.dgw, self._kdtree
                         )
+                        # 用Tlw_i将verts_warp还原回原始坐标系
+                        # verts_origin = Tlw.type_as(verts_warp)[:3, :3] @ verts_warp.T + Tlw.type_as(verts_warp)[:3, 3].view(3, 1)
+                        # verts_origin = verts_origin.T
+                        # partial_tsdf = trimesh.Trimesh(
+                        #     vertices=verts_origin, faces=faces, vertex_normals=norms
+                        # )
+                        # partial_tsdf.export(
+                        #     os.path.join(args.save_dir, f"origin_mesh_{str(i).zfill(6)}.obj")
+                        # )
                         # render depth, vertex and normal
                         image_size = [H, W]
                         # we already use Tlw_i in warping, so no need of passing it into rendering function
@@ -471,7 +550,7 @@ class DynFu:
                         depth_map,
                         normal_map,
                         vertex_map,
-                        Tlw_i,
+                        Tlw_i, #w2c
                         self.dgv,
                         self.dgse,
                         self.dgw,
@@ -513,11 +592,11 @@ class DynFu:
                 print(f"Done, now we have {self.dgv.shape[0]} nodes!")
             else:
                 print("Start update graph!")
-                try:
-                    # self.update_graph(Tlw)
-                    print(f"Done, now we have {self.dgv.shape[0]} nodes!")
-                except Exception as e:
-                    print(f"Failed to update graph because of {e}! ")
+                # try:
+                #     self.update_graph(Tlw)
+                #     print(f"Done, now we have {self.dgv.shape[0]} nodes!")
+                # except Exception as e:
+                #     print(f"Failed to update graph because of {e}! ")
                 # pass
             if i == 171:
                 break
@@ -562,10 +641,24 @@ class DynFu:
         """_summary_
         """        
         verts, faces, norms = self.tsdf_volume.get_mesh()
-        self._radius = 0.01  # the paper said e = 0.01 in experiment
+        self._radius = 0.1  # the paper said e = 0.01 in experiment
         self._vertices = verts
         self._faces = faces
         nodes_v, nodes_idx = uniform_sample(self._vertices, self._radius)
+        # 获取nodes_v在x,y,z维度的最大最小值
+        # x_min, x_max = nodes_v[:, 0].min(), nodes_v[:, 0].max()
+        # # 平均值
+        # x_mean = nodes_v[:, 0].mean()
+        # y_min, y_max = nodes_v[:, 1].min(), nodes_v[:, 1].max()
+        # y_mean = nodes_v[:, 1].mean()
+        # z_min, z_max = nodes_v[:, 2].min(), nodes_v[:, 2].max()
+        # z_mean = nodes_v[:, 2].mean()
+        # print(f"nodes_v x_min: {x_min}, x_max: {x_max}")
+        # print(f"nodes_v x_mean: {x_mean}")
+        # print(f"nodes_v y_min: {y_min}, y_max: {y_max}")
+        # print(f"nodes_v y_mean: {y_mean}")
+        # print(f"nodes_v z_min: {z_min}, z_max: {z_max}")
+        # print(f"nodes_v z_mean: {z_mean}")
         mesh = trimesh.Trimesh(vertices=verts,faces=faces)
         mesh.export(os.path.join(args.save_dir, f"init_mesh.obj"))
         point_cloud = trimesh.PointCloud(nodes_v)
@@ -606,7 +699,7 @@ class DynFu:
         )
         mask_unsupported = torch.min(verts_c_l2_dgw, dim=1).values >= 1
 
-        def get_se3_helper(Xc, Tlw, dgv, dgse, dgw, node_to_nn):
+        def get_vec_helper(Xc, Tlw, dgv, dgse, dgw, node_to_nn):
             dgv_nn = dgv[node_to_nn]
             dgw_nn = dgw[node_to_nn]
             make_dq_from_vec_vmap = get_vmap_make_dq_from_vec()
@@ -615,13 +708,15 @@ class DynFu:
             # assert dgse_nn.shape == (4, 8)
             # assert dgv_nn.shape == (4, 3)
             T = get_W(Xc, Tlw, dgse_nn, dgw_nn, dgv_nn)
-            # print(T)
+            print("T:",T)
             re_dq = dqnorm(SE3_dq(T.view(4, 4)))
-            # print(re_dq)
-            return re_dq.view(8)
 
-        get_se3_helper_vmap = vmap(
-            get_se3_helper, in_dims=(0, None, None, None, None, 0)
+            # print("dq:",re_dq.view(8))
+            vec = inverse_dq_to_vec(re_dq)
+            return vec
+
+        get_vec_helper_vmap = vmap(
+            get_vec_helper, in_dims=(0, None, None, None, None, 0)
         )
         nodes_v, nodes_idx = uniform_sample(
             verts_c[mask_unsupported].cpu(), self._radius
@@ -629,16 +724,16 @@ class DynFu:
         dists, idx = self._kdtree.query(nodes_v, k=4, workers=-1)
         nodes_v = torch.tensor(nodes_v).to(self.device)
         nodes_v_nn_idx = torch.tensor(idx).long().to(self.device)
-        nodes_se3 = (
-            get_se3_helper_vmap(
+        nodes_se = (
+            get_vec_helper_vmap(
                 nodes_v, Tlw, self.dgv, self.dgse, self.dgw, nodes_v_nn_idx
             )
             .float()
             .to(self.device)
         )
-        assert nodes_se3.shape[0] == nodes_v.shape[0]
+        assert nodes_se.shape[0] == nodes_v.shape[0]
         nodes_w = (
-            torch.tensor(2.0 * self._radius)
+            torch.tensor(3.0 * self._radius)
             .view(1, 1)
             .repeat_interleave(nodes_v.shape[0], 0)
             .to(self.device)
@@ -646,7 +741,7 @@ class DynFu:
         )
 
         self.dgv = torch.cat((self.dgv, nodes_v), dim=0).to(self.device)
-        self.dgse = torch.cat((self.dgse, nodes_se3), dim=0).to(self.device)
+        self.dgse = torch.cat((self.dgse, nodes_se), dim=0).to(self.device)
         self.dgw = torch.cat((self.dgw, nodes_w), dim=0).float().to(self.device)
         assert (
             self.dgv.shape[0] == self.dgw.shape[0]
