@@ -26,26 +26,59 @@ from tmp_utils import (
     plot_heatmap_step,
     plot_vis_activemap,
     get_vmap_make_dq_from_vec,
-    inverse_dq_to_vec
+    # inverse_dq_to_vec
 )
 import time
 from functorch import vmap, jacrev
 from icp import compute_normal, compute_vertex
 from typing import Container, List, Set, Dict, Tuple, Optional, Union, Any
 
+# 从8维对偶四元数提取旋转向量 theta 和平移向量 t
+def inverse_dq_to_vec(dq: torch.tensor) -> torch.tensor:
+    """
+    从8维对偶四元数 dq 提取旋转向量 theta 和平移向量 t
+    返回一个6维向量，前3维是旋转，后3维是平移
+    """
+    # 提取旋转向量 theta
+    # theta = extract_theta_from_q(dq[None][0][0:4])
+    # 计算旋转角度的模
+    theta_norm = 2 * [torch.acos(dq[0])[None]][0]  # 旋转角度的模
+    
+    # 避免 theta_norm == 0 的情况，用 where 代替 if 语句
+    sin_half_theta = torch.sqrt([torch.clamp(1 - dq[0]**2, min=1e-6)[None]][0])  # 防止除以零
+    axis = torch.stack([dq[1], dq[2], dq[3]]) / sin_half_theta
+    
+    # 如果 theta_norm 为零，旋转向量应该为零向量
+    theta = (theta_norm * axis)
+    theta = (torch.where(theta_norm == 0, [torch.zeros(3)[None]][0].to(dq), theta)).squeeze()
+    
+    # 提取平移向量 t
+    # translation = extract_translation_from_dual(dq[None][0])
+    translation = 2 * torch.stack([
+        -dq[4]*dq[1] + dq[5]*dq[0] - dq[6]*dq[3] + dq[7]*dq[2],
+        -dq[4]*dq[2] + dq[5]*dq[3] + dq[6]*dq[0] - dq[7]*dq[1],
+        -dq[4]*dq[3] - dq[5]*dq[2] + dq[6]*dq[1] + dq[7]*dq[0]
+    ]).squeeze()
+    print(theta.shape, translation.shape)
+    # 合并为一个6维向量
+    return torch.cat([theta, translation])
 
 def data_term(
-    gt_Xc: torch.tensor,
+    Xw: torch.tensor,
     Tlw: torch.tensor,
+    K: torch.tensor,
     dgv: torch.tensor,
     dgse: torch.tensor,
     dgw: torch.tensor,
     node_to_nn: torch.tensor,
+    vertex0,
+    normal0,
+    mask0
 ) -> torch.tensor:
     """_summary_
 
     Args:
-        gt_Xc (torch.tensor): _description_
+        Xc (torch.tensor): _description_
         Tlw (torch.tensor): _description_
         dgv (torch.tensor): _description_
         dgse (torch.tensor): _description_
@@ -55,14 +88,26 @@ def data_term(
     Returns:
         torch.tensor: _description_
     """
-    Xc = gt_Xc[2]
-    nc = gt_Xc[3]
-    gt_v = gt_Xc[0]
-    gt_n = gt_Xc[1]
     # print(Xc,nc,gt_v,gt_n)
-    Xt = warp_helper(Xc, Tlw, dgv, dgse, dgw, node_to_nn)
+    H, W, C = vertex0.shape
+    Xt = warp_helper(Xw, Tlw, dgv, dgse, dgw, node_to_nn)
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    u_ = torch.round((Xt[0] / Xt[2]) * fx + cx).long()  # [h, w]
+    v_ = torch.round((Xt[1] / Xt[2]) * fy + cy).long()  # [h, w]
+    inviews = (u_ > 0) & (u_ < W-1) & (v_ > 0) & (v_ < H-1)
+    u_ = torch.clamp(u_, 0, W - 1)
+    v_ = torch.clamp(v_, 0, H - 1)
+    v = [v_[None]][0]
+    u = [u_[None]][0]
+    # isValid  = mask0[v,u]>0
+    gt_x = vertex0[v,u].squeeze()
+    gt_n = normal0[v,u].squeeze()
+    # 根据isValid计算，如果不合法，gt_x的第三维变为0
+    # gt_x = gt_x * isValid.view(-1,1).repeat(1,3)
+
     # if you want it to similar to surfel warp, uncomment the lines below
-    e = gt_n.dot(gt_v - Xt).view(1, 1) ** 2 
+    print(gt_n.shape,gt_x.shape,Xt.shape)
+    e = inviews*(gt_n.dot(gt_x - Xt).view(1, 1) ** 2 )
     # print("Xt:", Xt,Xt.shape)
     # print("gt_v - Xt:", gt_v - Xt)
     # print("Dot product (e):", e)
@@ -98,12 +143,12 @@ def reg_term(
     shape = dgv.shape
     knn = dgv_nn.shape[1]
     # self warp
-    print('reg term self warp')
+    # print('reg term self warp')
     warp_helper_vmap = vmap(warp_helper, in_dims=(0, None, None, None, None, 0))
     dgv_warped = warp_helper_vmap(dgv, Tlw, dgv, dgse, dgw, dgv_nn)
 
     # self warp with neighbors' se3
-    print('reg term warp with neighbors')
+    # print('reg term warp with neighbors')
     dgv_nn_nn = dgv_nn[dgv_nn].view(-1, knn)
     dgv_rep = dgv.view(-1, 1, 3).repeat_interleave(knn, 1).view(-1, 3)
     dgv_nn_warp = warp_helper_vmap(dgv_rep, Tlw, dgv, dgse, dgw, dgv_nn_nn).view(
@@ -117,13 +162,17 @@ def reg_term(
 
 
 def energy(
-    gt_Xc: torch.tensor,
+    Xw: torch.tensor,
     Tlw: torch.tensor,
+    K: torch.tensor,
     dgv: torch.tensor,
     dgse: torch.tensor,
     dgw: torch.tensor,
     node_to_nn: torch.tensor,
     dgv_nn: torch.tensor,
+    vertex0: torch.tensor,
+    normal0: torch.tensor,
+    mask0: torch.tensor,
 ) -> Tuple[torch.tensor, torch.tensor]:
     """_summary_
 
@@ -139,16 +188,16 @@ def energy(
     Returns:
         Tuple[torch.tensor, torch.tensor]: _description_
     """
-    data_vmap = vmap(data_term, in_dims=(0, None, None, None, None, 0))
+    data_vmap = vmap(data_term, in_dims=(0, None, None,None, None, None, 0,None,None,None))
     make_dq_from_vec_vmap = get_vmap_make_dq_from_vec()
     dgse_dq = make_dq_from_vec_vmap(dgse)
-    data_val_tmp = data_vmap(gt_Xc, Tlw, dgv, dgse_dq, dgw, node_to_nn)
+    data_val_tmp = data_vmap(Xw, Tlw, K,dgv, dgse_dq, dgw, node_to_nn,vertex0,normal0,mask0)
     # data_val_tmp2 = torch.where(torch.tensor(data_val_tmp >1e-5),data_val_tmp, torch.tensor(0.0).type_as(data_val_tmp))
     # data_val = data_val_tmp2.sum() / torch.tensor(data_val_tmp >1e-5).sum()
     data_val = data_val_tmp.mean()
     reg_val = reg_term(Tlw, dgv, dgse_dq, dgw, dgv_nn)
-    # re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
-    re = data_val
+    re = ((data_val + 5*reg_val) / 2).float() # 5 = lambda in surfelwarp paper
+    # re = data_val
     return re, re
 
 
@@ -196,6 +245,8 @@ def optim_energy(
     normal0 = compute_normal(vertex0)
     mask0 = depth0 > 0.0
     mask_hat = depth_map > 0.0
+    # 根据mask_hat筛选vertex_map, normal_map
+    vertex_cam = vertex_map[mask_hat]
     # assert mask_hat.shape == (480, 640)
     t1 = time.time()
     H, W = mask0.shape
@@ -205,99 +256,122 @@ def optim_energy(
     dists_nn=[]
     vertex_nn=[]
     w2c = torch.inverse(Tlw).to(vertex_map.device)
-    mask0_idx  = (mask0 ).nonzero(as_tuple=False)
-    mask_hat_idx = (mask_hat  ).nonzero(as_tuple=False)
-    activated_map[mask0_idx[:,0],mask0_idx[:,1] ] = torch.tensor(RED).float()
-    activated_map[mask_hat_idx[:,0],mask_hat_idx[:,1] ] = torch.tensor(YELLOW).float()
-    # map onto: depth0  -> our. 
-    anchor_mask =  mask_hat_idx
-    onto_mask =   mask0_idx
-    kdtree2d = KDTree(anchor_mask.cpu())
-    d, ii = kdtree2d.query(onto_mask.cpu(), k=1, workers=-1)
-    ii = ii[ii != anchor_mask.shape[0]]
-    anchor_mask_mapped_idx = anchor_mask[ii]
-    # activated_map[anchor_mask_mapped_idx[:,0],anchor_mask_mapped_idx[:,1] ] = torch.tensor(GREEN).float()
-    for i in range(anchor_mask_mapped_idx.shape[0]):
-        y0,x0 = onto_mask[i]
-        y,x = anchor_mask_mapped_idx[i]
-        if y0 == y and x == x0:
-            continue
-        activated_map[y,x] = torch.tensor(GREEN).float()
-        # Convert the vertex_map point from camera coordinates to world coordinates
-        vertex_cam = vertex_map[y, x]
-        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
-        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
-        # If there are missing neighbors, skip the point
-        if dgv.shape[0] in idx:
-            continue
-        # vertex_nn存储vertex_map[y,x]以及其knn个邻居的坐标
-        tmp=[]
-        tmp.append(vertex_world)
-        for idxx in idx:
-            tmp.append(dgv[idxx])
-        vertex_nn.append(tmp)
-        dists_nn.append(dists)
-        node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
-        res.append(
-            torch.stack(
-                [
-                    vertex0[y0, x0],
-                    normal0[y0, x0],
-                    vertex_world.to(vertex_map.device),
-                    # vertex_map[y, x],
-                    normal_map[y, x],
-                ]
-            )
-        )
-    # map onto: our -> depth0  . 
-    anchor_mask =   mask0_idx
-    onto_mask =  mask_hat_idx
-    kdtree2d = KDTree(anchor_mask.cpu())
-    d, ii = kdtree2d.query(onto_mask.cpu(), k=1, workers=-1)
-    ii = ii[ii != anchor_mask.shape[0]]
-    anchor_mask_mapped_idx = anchor_mask[ii]
-    # activated_map[anchor_mask_mapped_idx[:,0],anchor_mask_mapped_idx[:,1] ] = torch.tensor(GREEN).float()
-    for i in range(anchor_mask_mapped_idx.shape[0]):
-        y0,x0 = anchor_mask_mapped_idx[i]
-        y,x =  onto_mask[i]
-        if y0 == y and x == x0:
-            continue
-        activated_map[y0,x0] = torch.tensor(GREEN).float()
-        # dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
-        vertex_cam = vertex_map[y, x]
-        vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
-        dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
-        # If there are missing neighbors, skip the point
-        if dgv.shape[0] in idx:
-            continue
-        tmp=[]
-        tmp.append(vertex_world)
-        for idxx in idx:
-            tmp.append(dgv[idxx])
-        vertex_nn.append(tmp)
-        dists_nn.append(dists)
-        node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
-        res.append(
-            torch.stack(
-                [
-                    vertex0[y0, x0],
-                    normal0[y0, x0],
-                    vertex_world.to(vertex_map.device),
-                    # vertex_map[y, x],
-                    normal_map[y, x],
-                ]
-            )
-        )
+    # 将vertex_map转换到世界坐标系
+    vertex_world = (w2c[:3, :3] @ vertex_cam.T + w2c[:3, 3].view(3, 1)).T
+    # 查询kdtree获取这些vertex_world的k近邻dgv
+    dists, idx = kdtree.query(vertex_world.cpu(), k=knn, workers=-1)
+    idx = torch.tensor(idx)
+    # 如果有缺失的邻居，跳过该点
+    valid_mask = ~(idx == dgv.shape[0]).any(dim=1)
+    idx_valid = idx[valid_mask]
+    vertex_world_valid = vertex_world[valid_mask]
+    node_to_nn = idx_valid.to(vertex_map.device)
 
-    print("done corrs: ", len(res), time.time()-t1)
-    plot_func_dict['plot_activemap'](activation_map=activated_map)
-    node_to_nn = torch.stack(node_to_nn)
+
+
+
+    # 扫描帧的非零合法图索引(注意是二维，分别是行与列)
+    # mask0_idx  = (mask0 ).nonzero(as_tuple=False)
+    # # 全局帧的非零合法图索引
+    # mask_hat_idx = (mask_hat  ).nonzero(as_tuple=False)
+    # # 扫描帧对应的全红
+    # activated_map[mask0_idx[:,0],mask0_idx[:,1] ] = torch.tensor(RED).float()
+    # # 全局帧对应的全黄
+    # activated_map[mask_hat_idx[:,0],mask_hat_idx[:,1] ] = torch.tensor(YELLOW).float()
+    # # map onto: depth0  -> our.  
+    # anchor_mask =  mask_hat_idx
+    # onto_mask =   mask0_idx
+    # # 构造全局帧的kdtree
+    # kdtree2d = KDTree(anchor_mask.cpu())
+    # # 在全局帧图寻找当前扫描帧对应的最近合法点
+    # d, ii = kdtree2d.query(onto_mask.cpu(), k=1, workers=-1)
+    # ii = ii[ii != anchor_mask.shape[0]]
+    # # 对应的全局帧中合法且近邻的索引
+    # anchor_mask_mapped_idx = anchor_mask[ii]
+    # 标记为绿色
+    # activated_map[anchor_mask_mapped_idx[:,0],anchor_mask_mapped_idx[:,1] ] = torch.tensor(GREEN).float()
+    # 遍历这些索引对应的像素，寻找当前扫描帧对应的全局帧的最近邻点的三维坐标以及相邻的4个最近关键点
+    # for i in range(anchor_mask_mapped_idx.shape[0]):
+    #     y0,x0 = onto_mask[i]
+    #     y,x = anchor_mask_mapped_idx[i]
+    #     if y0 == y and x == x0:
+    #         continue
+    #     activated_map[y,x] = torch.tensor(GREEN).float()
+    #     # Convert the vertex_map point from camera coordinates to world coordinates
+    #     vertex_cam = vertex_map[y, x]
+    #     vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+    #     dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
+    #     # If there are missing neighbors, skip the point
+    #     if dgv.shape[0] in idx:
+    #         continue
+    #     # vertex_nn存储vertex_map[y,x]以及其knn个邻居的坐标
+    #     tmp=[]
+    #     tmp.append(vertex_world)
+    #     for idxx in idx:
+    #         tmp.append(dgv[idxx])
+    #     vertex_nn.append(tmp)
+    #     dists_nn.append(dists)
+    #     node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
+    #     res.append(
+    #         torch.stack(
+    #             [
+    #                 vertex0[y0, x0],
+    #                 normal0[y0, x0],
+    #                 vertex_world.to(vertex_map.device),
+    #                 # vertex_map[y, x],
+    #                 normal_map[y, x],
+    #             ]
+    #         )
+    #     )
+    # # map onto: our -> depth0  . 
+    # anchor_mask =   mask0_idx
+    # onto_mask =  mask_hat_idx
+    # kdtree2d = KDTree(anchor_mask.cpu())
+    # d, ii = kdtree2d.query(onto_mask.cpu(), k=1, workers=-1)
+    # ii = ii[ii != anchor_mask.shape[0]]
+    # anchor_mask_mapped_idx = anchor_mask[ii]
+    # # activated_map[anchor_mask_mapped_idx[:,0],anchor_mask_mapped_idx[:,1] ] = torch.tensor(GREEN).float()
+    # for i in range(anchor_mask_mapped_idx.shape[0]):
+    #     y0,x0 = anchor_mask_mapped_idx[i]
+    #     y,x =  onto_mask[i]
+    #     if y0 == y and x == x0:
+    #         continue
+    #     activated_map[y0,x0] = torch.tensor(GREEN).float()
+    #     # dists, idx = kdtree.query(vertex_map[y, x].cpu(), k=knn, workers=-1)
+    #     vertex_cam = vertex_map[y, x]
+    #     vertex_world = (w2c[:3, :3] @ vertex_cam + w2c[:3, 3]).cpu()
+    #     dists, idx = kdtree.query(vertex_world, k=knn, workers=-1)
+    #     # If there are missing neighbors, skip the point
+    #     if dgv.shape[0] in idx:
+    #         continue
+    #     tmp=[]
+    #     tmp.append(vertex_world)
+    #     for idxx in idx:
+    #         tmp.append(dgv[idxx])
+    #     vertex_nn.append(tmp)
+    #     dists_nn.append(dists)
+    #     node_to_nn.append(torch.tensor(idx).type_as(vertex_map).long())
+    #     res.append(
+    #         torch.stack(
+    #             [
+    #                 vertex0[y0, x0],
+    #                 normal0[y0, x0],
+    #                 vertex_world.to(vertex_map.device),
+    #                 # vertex_map[y, x],
+    #                 normal_map[y, x],
+    #             ]
+    #         )
+    #     )
+
+    # print("done corrs: ", len(res), time.time()-t1)
+    # plot_func_dict['plot_activemap'](activation_map=activated_map)
+    # node_to_nn = torch.stack(node_to_nn)
     dists, idx = kdtree.query(dgv.cpu(), k=range(2, 2 + knn), workers=-1)
     dgv_nn = torch.tensor(idx).type_as(dgv).long()
-    res = torch.stack(res)
-    assert len(res.shape) == 3  # filtered_dim, 4, 3
+    # res = torch.stack(res)
+    # assert len(res.shape) == 3  # filtered_dim, 4, 3
     assert len(node_to_nn.shape) == 2  # filtered_dim, 4
-    energy_jac = jacrev(energy, argnums=3, has_aux=True)
+    energy_jac = jacrev(energy, argnums=4, has_aux=True)
     dqnorm_vmap = vmap(dqnorm, in_dims=0)
     # print("Start optimize! ")
     I = torch.eye(6).type_as(Tlw)  # to counter not full rank
@@ -310,7 +384,7 @@ def optim_energy(
     for i in range(5):
         t1 = time.time()
         print("start compute jse3")
-        jse3, fx = energy_jac(res, Tlw, dgv, dgse, dgw, node_to_nn, dgv_nn)
+        jse3, fx = energy_jac(vertex_world_valid, Tlw,K, dgv, dgse, dgw, node_to_nn, dgv_nn,vertex0,normal0,mask0)
         if torch.sum(fx) < 1e-5:
             break
         # lmda = torch.mean(jse3.abs()) 
@@ -374,7 +448,7 @@ def optim_energy(
         elif old_loss > torch.sum(fx):
             old_loss = torch.sum(fx) 
             aggressive += 1
-            if aggressive == 5:
+            if aggressive == 3:
                 aggressive = 0
                 lr = min(lr*2,8.0)
     return dgse.clone(), torch.sum(fx)
@@ -593,11 +667,10 @@ class DynFu:
             else:
                 print("Start update graph!")
                 # try:
-                #     self.update_graph(Tlw)
-                #     print(f"Done, now we have {self.dgv.shape[0]} nodes!")
+                self.update_graph(Tlw)
+                print(f"Done, now we have {self.dgv.shape[0]} nodes!")
                 # except Exception as e:
                 #     print(f"Failed to update graph because of {e}! ")
-                # pass
             if i == 171:
                 break
         avg_time = np.array(t).mean()
@@ -714,6 +787,35 @@ class DynFu:
             # print("dq:",re_dq.view(8))
             vec = inverse_dq_to_vec(re_dq)
             return vec
+        # 提取旋转向量 theta 和平移向量 t
+        def extract_theta_from_q(q_real: torch.tensor) -> torch.tensor:
+            """
+            从旋转四元数 q_real 提取旋转向量 theta
+            """
+            
+            # 计算旋转角度的模
+            theta_norm = 2 * torch.acos(q_real[0])[None][0]  # 旋转角度的模
+            
+            # 避免 theta_norm == 0 的情况，用 where 代替 if 语句
+            sin_half_theta = torch.sqrt(torch.clamp(1 - q_real[0]**2, min=1e-6))[None][0]  # 防止除以零
+            axis = torch.stack([q_real[1], q_real[2], q_real[3]]) / sin_half_theta
+            
+            # 如果 theta_norm 为零，旋转向量应该为零向量
+            theta = (theta_norm * axis)[None][0]
+            theta = (torch.where(theta_norm == 0, torch.zeros(3)[None][0].to(q_real), theta))[None][0]
+            
+            return theta
+
+        def extract_translation_from_dual(dq: torch.tensor) -> torch.tensor:
+            
+            # 根据对偶四元数和平移的关系推导平移向量 t
+            translation = 2 * torch.tensor([
+                -dq[4]*dq[1] + dq[5]*dq[0] - dq[6]*dq[3] + dq[7]*dq[2],
+                -dq[4]*dq[2] + dq[5]*dq[3] + dq[6]*dq[0] - dq[7]*dq[1],
+                -dq[4]*dq[3] - dq[5]*dq[2] + dq[6]*dq[1] + dq[7]*dq[0]
+            ])[None][0]
+            
+            return translation
 
         get_vec_helper_vmap = vmap(
             get_vec_helper, in_dims=(0, None, None, None, None, 0)
